@@ -2,10 +2,15 @@
 import { preferences } from '@kit.ArkData';
 import { reminderAgentManager } from '@kit.BackgroundTasksKit';
 import { promptAction } from '@kit.ArkUI';
+import notification from '@ohos.notification';
 
 const STORE_NAME = 'watertube_reminders';
 const STORE_KEY = 'items';
 const ALL_DAYS: Array<number> = [1, 2, 3, 4, 5, 6, 7];
+const ALL_MONTHS: Array<number> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const WEEK_LABELS: Array<string> = ['一', '二', '三', '四', '五', '六', '日'];
+
+type RepeatMode = 'once' | 'daily' | 'weekly' | 'monthly' | 'yearly';
 
 interface ReminderItem {
   id: string;
@@ -15,21 +20,39 @@ interface ReminderItem {
   minute: number;
   enabled: boolean;
   reminderId: number;
+  repeatMode: RepeatMode;
+  year: number;
+  month: number;
+  day: number;
+  daysOfWeek: Array<number>;
 }
 
 @Entry
 @Component
 struct Index {
   @State reminders: ReminderItem[] = [];
+  @State showEditor: boolean = false;
   @State titleInput: string = '';
   @State noteInput: string = '';
   @State selectedTime: Date = new Date(2026, 0, 1, 9, 0, 0);
+  @State selectedDate: Date = new Date();
+  @State repeatMode: RepeatMode = 'daily';
+  @State selectedWeekDays: Array<number> = [1, 2, 3, 4, 5];
   @State busy: boolean = false;
 
   private context: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
 
   aboutToAppear(): void {
+    this.requestNoticePermission();
     this.loadReminders();
+  }
+
+  private async requestNoticePermission(): Promise<void> {
+    try {
+      await notification.requestEnableNotification();
+    } catch (err) {
+      this.toast('请允许通知权限，否则提醒无法弹出');
+    }
   }
 
   private async loadReminders(): Promise<void> {
@@ -38,19 +61,29 @@ struct Index {
       const raw = await store.get(STORE_KEY, '[]');
       if (typeof raw === 'string') {
         const items = JSON.parse(raw) as ReminderItem[];
-        this.reminders = items.map((item: ReminderItem): ReminderItem => ({
-          id: item.id,
-          title: item.title,
-          note: item.note,
-          hour: item.hour,
-          minute: item.minute,
-          enabled: item.enabled,
-          reminderId: item.reminderId ?? -1
-        }));
+        this.reminders = items.map((item: ReminderItem): ReminderItem => this.normalizeItem(item));
       }
     } catch (err) {
       this.toast('读取提醒失败');
     }
+  }
+
+  private normalizeItem(item: ReminderItem): ReminderItem {
+    const now = new Date();
+    return {
+      id: item.id,
+      title: item.title,
+      note: item.note ?? '',
+      hour: item.hour,
+      minute: item.minute,
+      enabled: item.enabled,
+      reminderId: item.reminderId ?? -1,
+      repeatMode: item.repeatMode ?? 'daily',
+      year: item.year ?? now.getFullYear(),
+      month: item.month ?? (now.getMonth() + 1),
+      day: item.day ?? now.getDate(),
+      daysOfWeek: item.daysOfWeek?.length ? item.daysOfWeek : ALL_DAYS
+    };
   }
 
   private async saveReminders(items: ReminderItem[]): Promise<void> {
@@ -60,10 +93,33 @@ struct Index {
     this.reminders = items;
   }
 
+  private resetEditor(): void {
+    const now = new Date();
+    this.titleInput = '';
+    this.noteInput = '';
+    this.selectedTime = new Date(2026, 0, 1, 9, 0, 0);
+    this.selectedDate = now;
+    this.repeatMode = 'daily';
+    this.selectedWeekDays = [1, 2, 3, 4, 5];
+  }
+
+  private openEditor(): void {
+    this.resetEditor();
+    this.showEditor = true;
+  }
+
+  private closeEditor(): void {
+    this.showEditor = false;
+  }
+
   private async addReminder(): Promise<void> {
     const title = this.titleInput.trim();
     if (!title) {
       this.toast('先写提醒内容');
+      return;
+    }
+    if (this.repeatMode === 'weekly' && this.selectedWeekDays.length === 0) {
+      this.toast('至少选择一天');
       return;
     }
 
@@ -75,14 +131,19 @@ struct Index {
       hour: this.selectedTime.getHours(),
       minute: this.selectedTime.getMinutes(),
       enabled: true,
-      reminderId: -1
+      reminderId: -1,
+      repeatMode: this.repeatMode,
+      year: this.selectedDate.getFullYear(),
+      month: this.selectedDate.getMonth() + 1,
+      day: this.selectedDate.getDate(),
+      daysOfWeek: this.selectedWeekDays.concat([]).sort()
     };
 
     try {
-      item.reminderId = await this.publishDailyReminder(item);
-      await this.saveReminders([item, ...this.reminders]);
-      this.titleInput = '';
-      this.noteInput = '';
+      await this.requestNoticePermission();
+      item.reminderId = await this.publishReminder(item);
+      await this.saveReminders([item].concat(this.reminders));
+      this.showEditor = false;
       this.toast('已添加');
     } catch (err) {
       this.toast('创建失败，请确认通知权限已开启');
@@ -90,25 +151,62 @@ struct Index {
     this.busy = false;
   }
 
-  private async publishDailyReminder(item: ReminderItem): Promise<number> {
-    const request: reminderAgentManager.ReminderRequestAlarm = {
-      reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_ALARM,
-      hour: item.hour,
-      minute: item.minute,
-      daysOfWeek: ALL_DAYS,
+  private async publishReminder(item: ReminderItem): Promise<number> {
+    if (item.repeatMode === 'daily' || item.repeatMode === 'weekly') {
+      const request: reminderAgentManager.ReminderRequestAlarm = {
+        reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_ALARM,
+        hour: item.hour,
+        minute: item.minute,
+        daysOfWeek: item.repeatMode === 'daily' ? ALL_DAYS : item.daysOfWeek,
+        title: '水管提醒',
+        content: this.notificationContent(item),
+        expiredContent: item.title,
+        snoozeContent: item.title,
+        notificationId: Number(item.id.slice(-8)),
+        tapDismissed: true,
+        wantAgent: {
+          pkgName: 'com.watertube.watertubereminder',
+          abilityName: 'EntryAbility'
+        }
+      };
+      return await reminderAgentManager.publishReminder(request);
+    }
+
+    const request: reminderAgentManager.ReminderRequestCalendar = {
+      reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_CALENDAR,
+      dateTime: {
+        year: item.year,
+        month: item.month,
+        day: item.day,
+        hour: item.hour,
+        minute: item.minute,
+        second: 0
+      },
       title: '水管提醒',
-      content: item.note ? `${item.title}：${item.note}` : item.title,
+      content: this.notificationContent(item),
       expiredContent: item.title,
       snoozeContent: item.title,
       notificationId: Number(item.id.slice(-8)),
-      slotType: 0,
       tapDismissed: true,
       wantAgent: {
         pkgName: 'com.watertube.watertubereminder',
         abilityName: 'EntryAbility'
       }
     };
+
+    if (item.repeatMode === 'monthly') {
+      request.repeatMonths = ALL_MONTHS;
+      request.repeatDays = [item.day];
+    } else if (item.repeatMode === 'yearly') {
+      request.repeatMonths = [item.month];
+      request.repeatDays = [item.day];
+    }
+
     return await reminderAgentManager.publishReminder(request);
+  }
+
+  private notificationContent(item: ReminderItem): string {
+    return item.note ? `${item.title}：${item.note}` : item.title;
   }
 
   private async setReminderEnabled(item: ReminderItem, enabled: boolean): Promise<void> {
@@ -116,7 +214,8 @@ struct Index {
     try {
       let reminderId = item.reminderId;
       if (enabled) {
-        reminderId = await this.publishDailyReminder(item);
+        await this.requestNoticePermission();
+        reminderId = await this.publishReminder(item);
       } else if (reminderId >= 0) {
         await reminderAgentManager.cancelReminder(reminderId);
         reminderId = -1;
@@ -124,14 +223,19 @@ struct Index {
 
       await this.saveReminders(this.reminders.map((current: ReminderItem): ReminderItem => {
         if (current.id === item.id) {
-          return {
+                    return {
             id: current.id,
             title: current.title,
             note: current.note,
             hour: current.hour,
             minute: current.minute,
             enabled,
-            reminderId
+            reminderId,
+            repeatMode: current.repeatMode,
+            year: current.year,
+            month: current.month,
+            day: current.day,
+            daysOfWeek: current.daysOfWeek
           };
         }
         return current;
@@ -156,10 +260,42 @@ struct Index {
     this.busy = false;
   }
 
+  private toggleWeekDay(day: number): void {
+    if (this.selectedWeekDays.includes(day)) {
+      this.selectedWeekDays = this.selectedWeekDays.filter((item: number): boolean => item !== day);
+    } else {
+      this.selectedWeekDays = this.selectedWeekDays.concat([day]).sort();
+    }
+  }
+
   private formatTime(hour: number, minute: number): string {
     const h = hour < 10 ? `0${hour}` : `${hour}`;
     const m = minute < 10 ? `0${minute}` : `${minute}`;
     return `${h}:${m}`;
+  }
+
+  private repeatText(item: ReminderItem): string {
+    if (item.repeatMode === 'once') {
+      return `${item.year}-${this.two(item.month)}-${this.two(item.day)} ${this.formatTime(item.hour, item.minute)}`;
+    }
+    if (item.repeatMode === 'daily') {
+      return `每天 ${this.formatTime(item.hour, item.minute)}`;
+    }
+    if (item.repeatMode === 'weekly') {
+      return `每周${this.weekText(item.daysOfWeek)} ${this.formatTime(item.hour, item.minute)}`;
+    }
+    if (item.repeatMode === 'monthly') {
+      return `每月${item.day}日 ${this.formatTime(item.hour, item.minute)}`;
+    }
+    return `每年${item.month}月${item.day}日 ${this.formatTime(item.hour, item.minute)}`;
+  }
+
+  private weekText(days: Array<number>): string {
+    return days.map((day: number): string => WEEK_LABELS[day - 1]).join('、');
+  }
+
+  private two(value: number): string {
+    return value < 10 ? `0${value}` : `${value}`;
   }
 
   private toast(message: string): void {
@@ -177,10 +313,10 @@ struct Index {
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
 
-        Text(`${this.formatTime(item.hour, item.minute)}  每天`)
+        Text(this.repeatText(item))
           .fontSize(13)
           .fontColor('#666666')
-          .margin({ top: 4 })
+          .margin({ top: 5 })
 
         if (item.note) {
           Text(item.note)
@@ -188,7 +324,7 @@ struct Index {
             .fontColor('#777777')
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .margin({ top: 4 })
+            .margin({ top: 5 })
         }
       }
       .layoutWeight(1)
@@ -218,108 +354,257 @@ struct Index {
     .margin({ bottom: 10 })
   }
 
-  build() {
-    Column() {
+  @Builder
+  private RepeatButton(label: string, mode: RepeatMode) {
+    Button(label)
+      .height(34)
+      .fontSize(13)
+      .fontColor(this.repeatMode === mode ? '#FFFFFF' : '#333333')
+      .backgroundColor(this.repeatMode === mode ? '#1F8A70' : '#EEF1EF')
+      .borderRadius(17)
+      .margin({ right: 8, bottom: 8 })
+      .onClick(() => {
+        this.repeatMode = mode;
+      })
+  }
+
+  @Builder
+  private WeekButton(day: number, label: string) {
+    Button(label)
+      .width(38)
+      .height(34)
+      .fontSize(13)
+      .fontColor(this.selectedWeekDays.includes(day) ? '#FFFFFF' : '#333333')
+      .backgroundColor(this.selectedWeekDays.includes(day) ? '#1F8A70' : '#EEF1EF')
+      .borderRadius(17)
+      .margin({ right: 6, bottom: 6 })
+      .onClick(() => {
+        this.toggleWeekDay(day);
+      })
+  }
+
+  @Builder
+  private ListPage() {
+    Stack({ alignContent: Alignment.BottomEnd }) {
       Column() {
-        Text('水管提醒')
-          .fontSize(24)
+        Column() {
+          Text('水管提醒')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#111111')
+            .width('100%')
+
+          Text(`${this.reminders.length} 个提醒`)
+            .fontSize(13)
+            .fontColor('#666666')
+            .margin({ top: 6 })
+            .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 18, bottom: 12 })
+
+        if (this.reminders.length === 0) {
+          Column() {
+            Text('暂无提醒')
+              .fontSize(17)
+              .fontColor('#333333')
+            Text('点右下角加号添加')
+              .fontSize(13)
+              .fontColor('#777777')
+              .margin({ top: 6 })
+          }
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+          .width('100%')
+        } else {
+          List() {
+            ForEach(this.reminders, (item: ReminderItem) => {
+              ListItem() {
+                this.ReminderRow(item)
+              }
+            }, (item: ReminderItem) => item.id)
+          }
+          .layoutWeight(1)
+          .width('100%')
+          .padding({ left: 20, right: 20, bottom: 88 })
+        }
+      }
+      .width('100%')
+      .height('100%')
+
+      Button('+')
+        .width(56)
+        .height(56)
+        .fontSize(30)
+        .fontColor('#FFFFFF')
+        .backgroundColor('#1F8A70')
+        .borderRadius(28)
+        .margin({ right: 22, bottom: 24 })
+        .enabled(!this.busy)
+        .onClick(() => {
+          this.openEditor();
+        })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
+  private EditorPage() {
+    Column() {
+      Row() {
+        Button('返回')
+          .height(36)
+          .fontSize(14)
+          .fontColor('#333333')
+          .backgroundColor('#EEF1EF')
+          .borderRadius(18)
+          .onClick(() => {
+            this.closeEditor();
+          })
+
+        Text('添加提醒')
+          .fontSize(20)
           .fontWeight(FontWeight.Bold)
           .fontColor('#111111')
-          .width('100%')
-
-        Text('每天准时提醒签到、打卡和别忘的小事')
-          .fontSize(13)
-          .fontColor('#666666')
-          .margin({ top: 6 })
-          .width('100%')
+          .margin({ left: 14 })
       }
-      .alignItems(HorizontalAlign.Start)
       .width('100%')
-      .padding({ left: 20, right: 20, top: 18, bottom: 10 })
+      .padding({ left: 20, right: 20, top: 18, bottom: 12 })
 
-      Column() {
-        TextInput({ placeholder: '提醒内容，例如：去某软件签到', text: this.titleInput })
-          .height(46)
-          .fontSize(15)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8)
-          .onChange((value: string) => {
-            this.titleInput = value;
-          })
-
-        TextInput({ placeholder: '备注，可不填', text: this.noteInput })
-          .height(42)
-          .fontSize(14)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(8)
-          .margin({ top: 8 })
-          .onChange((value: string) => {
-            this.noteInput = value;
-          })
-
-        Row() {
-          Text('时间')
+      Scroll() {
+        Column() {
+          TextInput({ placeholder: '提醒内容，例如：去某软件签到', text: this.titleInput })
+            .height(46)
             .fontSize(15)
-            .fontColor('#333333')
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.titleInput = value;
+            })
 
-          Blank()
+          TextInput({ placeholder: '备注，可不填', text: this.noteInput })
+            .height(42)
+            .fontSize(14)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+            .margin({ top: 8 })
+            .onChange((value: string) => {
+              this.noteInput = value;
+            })
 
-          TimePicker({ selected: this.selectedTime })
-            .useMilitaryTime(true)
-            .height(120)
-            .onChange((value: TimePickerResult) => {
-              const next = new Date(this.selectedTime.getTime());
-              next.setHours(value.hour ?? 9);
-              next.setMinutes(value.minute ?? 0);
-              this.selectedTime = next;
+          Column() {
+            Text('重复')
+              .fontSize(15)
+              .fontColor('#333333')
+              .width('100%')
+              .margin({ bottom: 10 })
+
+            Flex({ wrap: FlexWrap.Wrap }) {
+              this.RepeatButton('仅一次', 'once')
+              this.RepeatButton('每天', 'daily')
+              this.RepeatButton('每周', 'weekly')
+              this.RepeatButton('每月', 'monthly')
+              this.RepeatButton('每年', 'yearly')
+            }
+          }
+          .width('100%')
+          .padding(14)
+          .backgroundColor('#FFFFFF')
+          .borderRadius(8)
+          .margin({ top: 10 })
+
+          if (this.repeatMode === 'weekly') {
+            Column() {
+              Text('星期')
+                .fontSize(15)
+                .fontColor('#333333')
+                .width('100%')
+                .margin({ bottom: 10 })
+
+              Flex({ wrap: FlexWrap.Wrap }) {
+                ForEach(ALL_DAYS, (day: number) => {
+                  this.WeekButton(day, WEEK_LABELS[day - 1])
+                })
+              }
+            }
+            .width('100%')
+            .padding(14)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+            .margin({ top: 10 })
+          }
+
+          if (this.repeatMode === 'once' || this.repeatMode === 'monthly' || this.repeatMode === 'yearly') {
+            Row() {
+              Text(this.repeatMode === 'monthly' ? '选择日期中的“日”' : '日期')
+                .fontSize(15)
+                .fontColor('#333333')
+              Blank()
+              DatePicker({ start: new Date(2020, 0, 1), end: new Date(2099, 11, 31), selected: this.selectedDate })
+                .height(150)
+                .onChange((value: DatePickerResult) => {
+                  this.selectedDate = new Date(value.year ?? this.selectedDate.getFullYear(), (value.month ?? (this.selectedDate.getMonth() + 1)) - 1, value.day ?? this.selectedDate.getDate());
+                })
+            }
+            .height(158)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+            .margin({ top: 10 })
+          }
+
+          Row() {
+            Text('时间')
+              .fontSize(15)
+              .fontColor('#333333')
+            Blank()
+            TimePicker({ selected: this.selectedTime })
+              .useMilitaryTime(true)
+              .height(130)
+              .onChange((value: TimePickerResult) => {
+                const next = new Date(this.selectedTime.getTime());
+                next.setHours(value.hour ?? 9);
+                next.setMinutes(value.minute ?? 0);
+                this.selectedTime = next;
+              })
+          }
+          .height(138)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor('#FFFFFF')
+          .borderRadius(8)
+          .margin({ top: 10 })
+
+          Button(this.busy ? '处理中' : '保存提醒')
+            .width('100%')
+            .height(44)
+            .fontSize(16)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#1F8A70')
+            .borderRadius(8)
+            .enabled(!this.busy)
+            .margin({ top: 14, bottom: 24 })
+            .onClick(() => {
+              this.addReminder();
             })
         }
-        .height(128)
-        .padding({ left: 12, right: 12 })
-        .backgroundColor('#FFFFFF')
-        .borderRadius(8)
-        .margin({ top: 8 })
-
-        Button(this.busy ? '处理中' : '添加提醒')
-          .width('100%')
-          .height(44)
-          .fontSize(16)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#1F8A70')
-          .borderRadius(8)
-          .enabled(!this.busy)
-          .margin({ top: 10 })
-          .onClick(() => {
-            this.addReminder();
-          })
+        .width('100%')
+        .padding({ left: 20, right: 20 })
       }
+      .layoutWeight(1)
       .width('100%')
-      .padding({ left: 20, right: 20, bottom: 12 })
+    }
+    .width('100%')
+    .height('100%')
+  }
 
-      if (this.reminders.length === 0) {
-        Column() {
-          Text('暂无提醒')
-            .fontSize(16)
-            .fontColor('#333333')
-          Text('添加后会调用系统提醒，到点弹出通知')
-            .fontSize(13)
-            .fontColor('#777777')
-            .margin({ top: 6 })
-        }
-        .layoutWeight(1)
-        .justifyContent(FlexAlign.Center)
-        .width('100%')
+  build() {
+    Column() {
+      if (this.showEditor) {
+        this.EditorPage()
       } else {
-        List() {
-          ForEach(this.reminders, (item: ReminderItem) => {
-            ListItem() {
-              this.ReminderRow(item)
-            }
-          }, (item: ReminderItem) => item.id)
-        }
-        .layoutWeight(1)
-        .width('100%')
-        .padding({ left: 20, right: 20, bottom: 16 })
+        this.ListPage()
       }
     }
     .width('100%')
@@ -327,3 +612,4 @@ struct Index {
     .backgroundColor('#F5F7F6')
   }
 }
+
