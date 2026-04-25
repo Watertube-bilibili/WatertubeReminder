@@ -1,8 +1,8 @@
-﻿import { common } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { reminderAgentManager } from '@kit.BackgroundTasksKit';
 import { promptAction } from '@kit.ArkUI';
-import notification from '@ohos.notification';
+import notificationManager from '@ohos.notificationManager';
 
 const STORE_NAME = 'watertube_reminders';
 const STORE_KEY = 'items';
@@ -39,20 +39,45 @@ struct Index {
   @State repeatMode: RepeatMode = 'daily';
   @State selectedWeekDays: Array<number> = [1, 2, 3, 4, 5];
   @State busy: boolean = false;
+  private hasAskedPermission: boolean = false;
 
   private context: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
 
   aboutToAppear(): void {
-    this.requestNoticePermission();
+    this.showPermissionIntro();
     this.loadReminders();
+  }
+
+  private showPermissionIntro(): void {
+    if (this.hasAskedPermission) {
+      return;
+    }
+    this.hasAskedPermission = true;
+    AlertDialog.show({
+      title: '允许通知提醒',
+      message: '水管提醒需要通知和提醒权限，才能在你设置的时间弹出系统提醒。',
+      primaryButton: {
+        value: '允许',
+        action: () => {
+          this.requestNoticePermission();
+        }
+      },
+      secondaryButton: {
+        value: '稍后',
+        action: () => {
+          this.toast('稍后也可以创建时再授权');
+        }
+      }
+    });
   }
 
   private async requestNoticePermission(): Promise<void> {
     try {
-      await notification.requestEnableNotification();
+      await notificationManager.requestEnableNotification();
     } catch (err) {
-      this.toast('请允许通知权限，否则提醒无法弹出');
+      // Some systems throw when notification is already enabled or managed in Settings.
     }
+
   }
 
   private async loadReminders(): Promise<void> {
@@ -146,7 +171,7 @@ struct Index {
       this.showEditor = false;
       this.toast('已添加');
     } catch (err) {
-      this.toast('创建失败，请确认通知权限已开启');
+      this.toast("创建失败：" + this.errorText(err));
     }
     this.busy = false;
   }
@@ -298,8 +323,24 @@ struct Index {
     return value < 10 ? `0${value}` : `${value}`;
   }
 
+  private errorText(err: Object): string {
+    const error = err as Record<string, Object>;
+    const code = error['code'];
+    const message = error['message'];
+    if (code !== undefined && message !== undefined) {
+      return `${code} ${message}`;
+    }
+    if (code !== undefined) {
+      return `${code}`;
+    }
+    if (message !== undefined) {
+      return `${message}`;
+    }
+    return '未知错误';
+  }
+
   private toast(message: string): void {
-    promptAction.showToast({ message, duration: 1800 });
+    promptAction.showToast({ message, duration: 2200 });
   }
 
   @Builder
