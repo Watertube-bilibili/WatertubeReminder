@@ -3,12 +3,14 @@ import { preferences } from '@kit.ArkData';
 import { reminderAgentManager } from '@kit.BackgroundTasksKit';
 import { promptAction } from '@kit.ArkUI';
 import notificationManager from '@ohos.notificationManager';
+import notification from '@ohos.notification';
 
 const STORE_NAME = 'watertube_reminders';
 const STORE_KEY = 'items';
 const ALL_DAYS: Array<number> = [1, 2, 3, 4, 5, 6, 7];
 const ALL_MONTHS: Array<number> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 const WEEK_LABELS: Array<string> = ['一', '二', '三', '四', '五', '六', '日'];
+const REMINDER_SLOT_TYPE: notification.SlotType = notification.SlotType.CONTENT_INFORMATION;
 
 type RepeatMode = 'once' | 'daily' | 'weekly' | 'monthly' | 'yearly';
 
@@ -39,45 +41,31 @@ struct Index {
   @State repeatMode: RepeatMode = 'daily';
   @State selectedWeekDays: Array<number> = [1, 2, 3, 4, 5];
   @State busy: boolean = false;
-  private hasAskedPermission: boolean = false;
 
   private context: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
 
   aboutToAppear(): void {
-    this.showPermissionIntro();
+    this.requestNoticePermission();
     this.loadReminders();
-  }
-
-  private showPermissionIntro(): void {
-    if (this.hasAskedPermission) {
-      return;
-    }
-    this.hasAskedPermission = true;
-    AlertDialog.show({
-      title: '允许通知提醒',
-      message: '水管提醒需要通知和提醒权限，才能在你设置的时间弹出系统提醒。',
-      primaryButton: {
-        value: '允许',
-        action: () => {
-          this.requestNoticePermission();
-        }
-      },
-      secondaryButton: {
-        value: '稍后',
-        action: () => {
-          this.toast('稍后也可以创建时再授权');
-        }
-      }
-    });
   }
 
   private async requestNoticePermission(): Promise<void> {
     try {
       await notificationManager.requestEnableNotification();
     } catch (err) {
-      // Some systems throw when notification is already enabled or managed in Settings.
+      // The system may throw when notification is already enabled or managed in Settings.
     }
+  }
 
+  private async prepareReminderChannel(): Promise<void> {
+    await this.requestNoticePermission();
+    await reminderAgentManager.addNotificationSlot({
+      type: REMINDER_SLOT_TYPE,
+      level: notification.SlotLevel.LEVEL_HIGH,
+      desc: '水管提醒通知',
+      badgeFlag: true,
+      vibrationEnabled: true
+    });
   }
 
   private async loadReminders(): Promise<void> {
@@ -165,7 +153,7 @@ struct Index {
     };
 
     try {
-      await this.requestNoticePermission();
+      await this.prepareReminderChannel();
       item.reminderId = await this.publishReminder(item);
       await this.saveReminders([item].concat(this.reminders));
       this.showEditor = false;
@@ -188,6 +176,7 @@ struct Index {
         expiredContent: item.title,
         snoozeContent: item.title,
         notificationId: Number(item.id.slice(-8)),
+        slotType: REMINDER_SLOT_TYPE,
         tapDismissed: true,
         wantAgent: {
           pkgName: 'com.watertube.watertubereminder',
@@ -212,6 +201,7 @@ struct Index {
       expiredContent: item.title,
       snoozeContent: item.title,
       notificationId: Number(item.id.slice(-8)),
+      slotType: REMINDER_SLOT_TYPE,
       tapDismissed: true,
       wantAgent: {
         pkgName: 'com.watertube.watertubereminder',
@@ -239,7 +229,7 @@ struct Index {
     try {
       let reminderId = item.reminderId;
       if (enabled) {
-        await this.requestNoticePermission();
+        await this.prepareReminderChannel();
         reminderId = await this.publishReminder(item);
       } else if (reminderId >= 0) {
         await reminderAgentManager.cancelReminder(reminderId);
@@ -325,6 +315,9 @@ struct Index {
 
   private errorText(err: Object): string {
     const error = err as Record<string, Object>;
+    if (error['code'] === 1700001) {
+      return '系统通知仍未对水管提醒生效，请在系统设置里确认“水管提醒”的通知和提醒权限都已允许';
+    }
     const code = error['code'];
     const message = error['message'];
     if (code !== undefined && message !== undefined) {
