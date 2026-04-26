@@ -106,6 +106,44 @@ struct Index {
     this.reminders = items;
   }
 
+  private isReminderLimitError(err: Object): boolean {
+    const error = err as Record<string, Object>;
+    return error['code'] === 1700002;
+  }
+
+  private async rebuildSystemReminders(items: Array<ReminderItem>): Promise<Array<ReminderItem>> {
+    await this.prepareReminderChannel();
+    try {
+      await reminderAgentManager.cancelAllReminders();
+    } catch (err) {
+      // If there are no reminders to cancel, continue with a clean publish pass.
+    }
+
+    const rebuilt: Array<ReminderItem> = [];
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      let reminderId = -1;
+      if (item.enabled) {
+        reminderId = await this.publishReminder(item);
+      }
+      rebuilt.push({
+        id: item.id,
+        title: item.title,
+        note: item.note,
+        hour: item.hour,
+        minute: item.minute,
+        enabled: item.enabled,
+        reminderId,
+        repeatMode: item.repeatMode,
+        year: item.year,
+        month: item.month,
+        day: item.day,
+        daysOfWeek: item.daysOfWeek
+      });
+    }
+    return rebuilt;
+  }
+
   private resetEditor(): void {
     const now = new Date();
     this.titleInput = '';
@@ -154,8 +192,18 @@ struct Index {
 
     try {
       await this.prepareReminderChannel();
-      item.reminderId = await this.publishReminder(item);
-      await this.saveReminders([item].concat(this.reminders));
+      try {
+        item.reminderId = await this.publishReminder(item);
+        await this.saveReminders([item].concat(this.reminders));
+      } catch (err) {
+        if (!this.isReminderLimitError(err)) {
+          this.toast("创建失败：" + this.errorText(err));
+          this.busy = false;
+          return;
+        }
+        const rebuilt = await this.rebuildSystemReminders([item].concat(this.reminders));
+        await this.saveReminders(rebuilt);
+      }
       this.showEditor = false;
       this.toast('已添加');
     } catch (err) {
@@ -317,6 +365,9 @@ struct Index {
     const error = err as Record<string, Object>;
     if (error['code'] === 1700001) {
       return '系统通知仍未对水管提醒生效，请在系统设置里确认“水管提醒”的通知和提醒权限都已允许';
+    }
+    if (error['code'] === 1700002) {
+      return '系统提醒数量已满，已尝试清理本应用旧提醒；请再点一次保存';
     }
     const code = error['code'];
     const message = error['message'];
